@@ -125,10 +125,62 @@ async function fetchTokenTxs(
   return allTxs;
 }
 
+// Mock data generator for testing UI without hitting Etherscan
+function generateMockResult(id: string) {
+  const days = 30;
+  const metrics: Record<string, { date: string; value: number }[]> = {};
+  const metricKeys = [
+    'supplyInMotion', 'tokenVelocity', 'senderReceiverRatio', 'avgTransferSize',
+    'retailRatio', 'exchangeNetFlow', 'washTradingPct', 'newAddressPct',
+    'onchainTxCount', 'onchainActiveAddrs',
+  ];
+  for (const key of metricKeys) {
+    metrics[key] = [];
+    for (let i = days; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 86400000);
+      const base = key === 'onchainTxCount' ? 500 : key === 'onchainActiveAddrs' ? 200 : key === 'avgTransferSize' ? 5000 : 0.5;
+      metrics[key].push({
+        date: d.toISOString().split('T')[0],
+        value: base * (0.7 + Math.random() * 0.6),
+      });
+    }
+  }
+
+  return {
+    token: { id, name: id, symbol: id.toUpperCase(), decimals: 18, circulatingSupply: 1000000000 },
+    chains: [
+      { name: 'Ethereum', chainId: 1, contract: '0xmock', transfers: 8432 },
+      { name: 'Polygon', chainId: 137, contract: '0xmock', transfers: 3201 },
+    ],
+    metrics,
+    events: {
+      exchangeFlowSpike: { detected: true, date: new Date().toISOString().split('T')[0], magnitude: 3.2, direction: 'outflow' as const },
+      anomalies: [
+        { metric: 'onchainTxCount', date: new Date().toISOString().split('T')[0], zScore: 2.8, value: 1200, avg: 500 },
+      ],
+      washTradingSurge: { detected: true, date: new Date().toISOString().split('T')[0], pct: 18 },
+      vestingCandidates: [
+        { from: '0x9270cc54...3299', value: 539, occurrences: 5, interval: 'biweekly' },
+        { from: '0xdfd5293d...963d', value: 539, occurrences: 4, interval: 'biweekly' },
+      ],
+      burnSpike: null,
+    },
+    summary: { totalTransfers: 11633, totalChains: 2, chainsWithData: 2, daysWithData: days },
+  };
+}
+
 // Main route
 onchainRoute.get('/', async (c) => {
   const id = c.req.query('id');
   if (!id) return c.json({ error: 'id required' }, 400);
+
+  // Mock mode: ?mock=1 returns instant fake data
+  if (c.req.query('mock') === '1') {
+    const mock = generateMockResult(id);
+    onchainCache.set(id, mock);
+    return c.json({ message: 'SUCCESS', cached: false, ...mock });
+  }
+
   if (!ETHERSCAN_KEY) return c.json({ error: 'ETHERSCAN_API_KEY not configured' }, 500);
 
   const noCache = c.req.query('nocache') === '1';
