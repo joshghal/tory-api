@@ -142,6 +142,7 @@ onchainRoute.get('/', async (c) => {
     return c.json({ message: 'SUCCESS', status: 'fetching', cached: false, summary: { totalChains: existingProgress.totalChains } });
   }
 
+  // Kick off scan in the background — return immediately so frontend can poll
   try {
     const coin = await getCoinDetail(id);
     if (!coin) return c.json({ error: 'Token not found' }, 404);
@@ -170,50 +171,65 @@ onchainRoute.get('/', async (c) => {
       });
     }
 
-    const ninetyDaysAgo = Math.floor(Date.now() / 1000) - 90 * 86400;
-    const allTransfers: RawTransfer[] = [];
-    const chainSummaries: { name: string; chainId: number; contract: string; transfers: number; error?: string }[] = [];
-
+    // Set progress BEFORE returning — so next poll sees "fetching"
     onchainProgress.set(id, {
       status: 'fetching', totalChains: supported.length, completedChains: 0,
       currentChain: supported[0]?.name || '', totalTransfers: 0, startedAt: Date.now(),
       currentChainChunks: 0, currentChainChunksDone: 0, currentChainTransfers: 0,
     });
 
-    for (const entry of supported) {
-      const { address, chainId, name } = entry;
-      const prog = onchainProgress.get(id);
-      if (prog) prog.currentChain = name;
+    // Fire-and-forget: scan runs in background
+    const scanInBackground = async () => {
+      const ninetyDaysAgo = Math.floor(Date.now() / 1000) - 90 * 86400;
+      const allTransfers: RawTransfer[] = [];
+      const chainSummaries: { name: string; chainId: number; contract: string; transfers: number; error?: string }[] = [];
 
-      try {
-        const txs = await fetchTokenTxs(entry, address, ninetyDaysAgo, (chunksDone, totalChunks, txsSoFar) => {
-          const prog = onchainProgress.get(id);
-          if (prog) { prog.currentChainChunks = totalChunks; prog.currentChainChunksDone = chunksDone; prog.currentChainTransfers = txsSoFar; }
-        });
-        for (const tx of txs) allTransfers.push(tx);
-        chainSummaries.push({ name, chainId, contract: address, transfers: txs.length });
-        if (prog) { prog.completedChains++; prog.totalTransfers += txs.length; }
-      } catch (err: any) {
-        chainSummaries.push({ name, chainId, contract: address, transfers: 0, error: err?.message?.slice(0, 80) });
-        if (prog) prog.completedChains++;
+      for (const entry of supported) {
+        const { address, chainId, name } = entry;
+        const prog = onchainProgress.get(id);
+        if (prog) prog.currentChain = name;
+
+        try {
+          const txs = await fetchTokenTxs(entry, address, ninetyDaysAgo, (chunksDone, totalChunks, txsSoFar) => {
+            const prog = onchainProgress.get(id);
+            if (prog) { prog.currentChainChunks = totalChunks; prog.currentChainChunksDone = chunksDone; prog.currentChainTransfers = txsSoFar; }
+          });
+          for (const tx of txs) allTransfers.push(tx);
+          chainSummaries.push({ name, chainId, contract: address, transfers: txs.length });
+          if (prog) { prog.completedChains++; prog.totalTransfers += txs.length; }
+        } catch (err: any) {
+          chainSummaries.push({ name, chainId, contract: address, transfers: 0, error: err?.message?.slice(0, 80) });
+          if (prog) prog.completedChains++;
+        }
+        await new Promise(r => setTimeout(r, 250));
       }
-      await new Promise(r => setTimeout(r, 250));
-    }
 
-    const prog = onchainProgress.get(id);
-    if (prog) prog.currentChain = 'Processing...';
-    const processed = processTransfers(allTransfers, circulatingSupply, decimals);
-    processed.summary.chainsWithData = chainSummaries.filter(cc => cc.transfers > 0).length;
+      const prog = onchainProgress.get(id);
+      if (prog) prog.currentChain = 'Processing...';
+      const processed = processTransfers(allTransfers, circulatingSupply, decimals);
+      processed.summary.chainsWithData = chainSummaries.filter(cc => cc.transfers > 0).length;
 
-    const result = {
-      token: { id, name: tokenName, symbol: tokenSymbol, decimals, circulatingSupply },
-      chains: chainSummaries, ...processed,
+      const result = {
+        token: { id, name: tokenName, symbol: tokenSymbol, decimals, circulatingSupply },
+        chains: chainSummaries, ...processed,
+      };
+
+      onchainCache.set(id, result);
+      onchainProgress.delete(id);
+      console.log(`[Onchain] ${id} scan complete: ${allTransfers.length} transfers across ${chainSummaries.length} chains`);
     };
 
-    onchainCache.set(id, result);
-    onchainProgress.delete(id);
+    // Start scan but don't await — return immediately
+    scanInBackground().catch(err => {
+      console.error(`[Onchain] ${id} background scan failed:`, err);
+      onchainProgress.delete(id);
+    });
 
-    return c.json({ message: 'SUCCESS', cached: false, ...result });
+    // Return immediately — frontend will poll /onchain/progress then re-call /onchain for cached result
+    return c.json({
+      message: 'SUCCESS', status: 'fetching', cached: false,
+      summary: { totalChains: supported.length },
+    });
   } catch (error: any) {
     console.error('[Onchain]', error);
     return c.json({ error: `Failed: ${error?.message}` }, 500);
