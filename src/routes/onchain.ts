@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { getCoinDetail } from '../lib/coingecko.js';
-import { processTransfers, type RawTransfer } from '../lib/onchainProcessor.js';
+import { processTransfers, type RawTransfer, type DailyMetrics } from '../lib/onchainProcessor.js';
 import { onchainCache, onchainProgress } from '../lib/onchainCache.js';
 
 export const onchainRoute = new Hono();
@@ -128,23 +128,19 @@ async function fetchTokenTxs(
 // Mock data generator for testing UI without hitting Etherscan
 function generateMockResult(id: string) {
   const days = 30;
-  const metrics: Record<string, { date: string; value: number }[]> = {};
-  const metricKeys = [
-    'supplyInMotion', 'tokenVelocity', 'senderReceiverRatio', 'avgTransferSize',
-    'retailRatio', 'exchangeNetFlow', 'washTradingPct', 'newAddressPct',
-    'onchainTxCount', 'onchainActiveAddrs',
-  ];
-  for (const key of metricKeys) {
-    metrics[key] = [];
+  const gen = (base: number) => {
+    const arr: { date: string; value: number }[] = [];
     for (let i = days; i >= 0; i--) {
       const d = new Date(Date.now() - i * 86400000);
-      const base = key === 'onchainTxCount' ? 500 : key === 'onchainActiveAddrs' ? 200 : key === 'avgTransferSize' ? 5000 : 0.5;
-      metrics[key].push({
-        date: d.toISOString().split('T')[0],
-        value: base * (0.7 + Math.random() * 0.6),
-      });
+      arr.push({ date: d.toISOString().split('T')[0], value: base * (0.7 + Math.random() * 0.6) });
     }
-  }
+    return arr;
+  };
+  const metrics: DailyMetrics = {
+    supplyInMotion: gen(0.5), tokenVelocity: gen(0.5), senderReceiverRatio: gen(0.5),
+    avgTransferSize: gen(5000), retailRatio: gen(0.5), exchangeNetFlow: gen(0.5),
+    washTradingPct: gen(0.5), newAddressPct: gen(0.5), onchainTxCount: gen(500), onchainActiveAddrs: gen(200),
+  };
 
   return {
     token: { id, name: id, symbol: id.toUpperCase(), decimals: 18, circulatingSupply: 1000000000 },
@@ -165,7 +161,10 @@ function generateMockResult(id: string) {
       ],
       burnSpike: null,
     },
-    summary: { totalTransfers: 11633, totalChains: 2, chainsWithData: 2, daysWithData: days },
+    summary: {
+      totalTransfers: 11633, daysOfData: days, chainsWithData: 2,
+      dateRange: { from: new Date(Date.now() - days * 86400000).toISOString().split('T')[0], to: new Date().toISOString().split('T')[0] },
+    },
   };
 }
 
@@ -181,13 +180,65 @@ onchainRoute.get('/', async (c) => {
     return c.json({ message: 'SUCCESS', cached: false, ...mock });
   }
 
-  if (!ETHERSCAN_KEY) return c.json({ error: 'ETHERSCAN_API_KEY not configured' }, 500);
+  // Mock loading mode: ?mock=loading simulates a slow scan with progress
+  if (c.req.query('mock') === 'loading') {
+    const noCache = c.req.query('nocache') === '1';
+    if (!noCache) {
+      const cached = onchainCache.get(id);
+      if (cached) return c.json({ message: 'SUCCESS', cached: true, ...cached.data });
+    }
 
+    const existing = onchainProgress.get(id);
+    if (existing && existing.status === 'fetching') {
+      return c.json({ message: 'SUCCESS', status: 'fetching', cached: false, summary: { totalChains: existing.totalChains } });
+    }
+
+    // Start mock background scan
+    onchainProgress.set(id, {
+      status: 'fetching', totalChains: 2, completedChains: 0,
+      currentChain: 'Ethereum', totalTransfers: 0, startedAt: Date.now(),
+      currentChainChunks: 15, currentChainChunksDone: 0, currentChainTransfers: 0,
+    });
+
+    // Simulate progress over ~15 seconds
+    (async () => {
+      const prog = onchainProgress.get(id);
+      if (!prog) return;
+      for (let i = 1; i <= 15; i++) {
+        await new Promise(r => setTimeout(r, 500));
+        prog.currentChainChunksDone = i;
+        prog.currentChainTransfers = i * 560;
+      }
+      prog.completedChains = 1;
+      prog.currentChain = 'Polygon';
+      prog.currentChainChunksDone = 0;
+      prog.currentChainTransfers = 0;
+      for (let i = 1; i <= 15; i++) {
+        await new Promise(r => setTimeout(r, 300));
+        prog.currentChainChunksDone = i;
+        prog.currentChainTransfers = i * 210;
+      }
+      prog.completedChains = 2;
+      prog.totalTransfers = 11633;
+      prog.currentChain = 'Processing...';
+      await new Promise(r => setTimeout(r, 1000));
+      const mock = generateMockResult(id);
+      onchainCache.set(id, mock);
+      onchainProgress.delete(id);
+      console.log(`[Onchain Mock] ${id} simulated scan complete`);
+    })();
+
+    return c.json({ message: 'SUCCESS', status: 'fetching', cached: false, summary: { totalChains: 2 } });
+  }
+
+  // Check cache BEFORE API key validation — cached data doesn't need Etherscan
   const noCache = c.req.query('nocache') === '1';
   const cached = onchainCache.get(id);
   if (!noCache && cached) {
     return c.json({ message: 'SUCCESS', cached: true, ...cached.data });
   }
+
+  if (!ETHERSCAN_KEY) return c.json({ error: 'ETHERSCAN_API_KEY not configured' }, 500);
 
   const existingProgress = onchainProgress.get(id);
   if (existingProgress && existingProgress.status === 'fetching') {
@@ -293,4 +344,17 @@ onchainRoute.get('/progress', async (c) => {
     currentChainChunksDone: prog.currentChainChunksDone,
     currentChainTransfers: prog.currentChainTransfers,
   });
+});
+
+// Cache clear (for testing)
+onchainRoute.delete('/cache', async (c) => {
+  const id = c.req.query('id');
+  if (id) {
+    onchainCache.delete(id);
+    onchainProgress.delete(id);
+    return c.json({ cleared: id });
+  }
+  onchainCache.clear();
+  onchainProgress.clear();
+  return c.json({ cleared: 'all' });
 });

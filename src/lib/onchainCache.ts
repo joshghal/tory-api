@@ -16,6 +16,8 @@ export const onchainCache = {
   set(id: string, data: ProcessedOnchain & { chains: any[] }) {
     cache.set(id, { data, ts: Date.now() });
   },
+  delete(id: string) { cache.delete(id); },
+  clear() { cache.clear(); },
 };
 
 // Progress tracker
@@ -37,4 +39,5 @@ export const onchainProgress = {
   get(id: string) { return progress.get(id) || null; },
   set(id: string, entry: OnchainProgressEntry) { progress.set(id, entry); },
   delete(id: string) { progress.delete(id); },
+  clear() { progress.clear(); },
 };
