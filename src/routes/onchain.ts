@@ -11,8 +11,9 @@ const PAGE_SIZE = 10000;
 interface ChainConfig {
   chainId: number;
   name: string;
-  source: 'etherscan' | 'custom';
+  source: 'etherscan' | 'custom' | 'rpc';
   customApi?: string;
+  rpcUrl?: string;
 }
 
 const CHAINS: Record<string, ChainConfig> = {
@@ -22,7 +23,7 @@ const CHAINS: Record<string, ChainConfig> = {
   base:                   { chainId: 8453,  name: 'Base',      source: 'custom', customApi: 'https://base.blockscout.com/api' },
   'optimistic-ethereum':  { chainId: 10,    name: 'Optimism',  source: 'custom', customApi: 'https://api.routescan.io/v2/network/mainnet/evm/10/etherscan/api' },
   avalanche:              { chainId: 43114, name: 'Avalanche', source: 'custom', customApi: 'https://api.routescan.io/v2/network/mainnet/evm/43114/etherscan/api' },
-  'binance-smart-chain':  { chainId: 56,    name: 'BSC',       source: 'custom', customApi: 'https://api.bscscan.com/api' },
+  'binance-smart-chain':  { chainId: 56,    name: 'BSC',       source: 'rpc', rpcUrl: 'https://bsc.drpc.org' },
 };
 
 async function fetchTokenTxs(
@@ -119,6 +120,82 @@ async function fetchTokenTxs(
           allTxs.push(...filtered);
         }
       } catch { /* no data */ }
+    }
+  } else if (chain.source === 'rpc' && chain.rpcUrl) {
+    // Fetch Transfer events via eth_getLogs (free RPC, no API key)
+    const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+    const rpc = chain.rpcUrl;
+
+    // Get latest block number
+    let latestBlock = 0;
+    try {
+      const res = await fetch(rpc, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', method: 'eth_blockNumber', params: [], id: 1 }),
+        signal: AbortSignal.timeout(10000),
+      });
+      const json = await res.json();
+      latestBlock = parseInt(json.result, 16);
+    } catch { /* no block */ }
+
+    // Estimate start block from timestamp (BSC ~3s per block)
+    const BLOCK_TIME = 3; // seconds
+    const secondsAgo = Math.floor(Date.now() / 1000) - startTimestamp;
+    const startBlock = Math.max(0, latestBlock - Math.ceil(secondsAgo / BLOCK_TIME));
+
+    if (latestBlock > startBlock) {
+      // Split into exactly 15 chunks (same as etherscan path) — dRPC handles large ranges for sparse tokens
+      const totalBlocks = latestBlock - startBlock;
+      const NUM_CHUNKS = 15;
+      const CHUNK_SIZE = Math.ceil(totalBlocks / NUM_CHUNKS);
+      onProgress?.(0, NUM_CHUNKS, 0);
+
+      for (let i = 0; i < NUM_CHUNKS; i++) {
+        const fromBlock = startBlock + (i * CHUNK_SIZE);
+        const toBlock = Math.min(fromBlock + CHUNK_SIZE - 1, latestBlock);
+        // Sub-chunk into 9999 block ranges (dRPC free tier limit is 10K inclusive)
+        const SUB_CHUNK = 9999;
+        for (let sub = fromBlock; sub <= toBlock; sub += SUB_CHUNK) {
+          const subTo = Math.min(sub + SUB_CHUNK - 1, toBlock);
+          try {
+            const res = await fetch(rpc, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                jsonrpc: '2.0', method: 'eth_getLogs', id: 1,
+                params: [{ fromBlock: `0x${sub.toString(16)}`, toBlock: `0x${subTo.toString(16)}`, address: contract, topics: [TRANSFER_TOPIC] }],
+              }),
+              signal: AbortSignal.timeout(15000),
+            });
+            const json = await res.json();
+            if (json.result && Array.isArray(json.result)) {
+              for (const log of json.result) {
+                const from = '0x' + (log.topics[1] || '').slice(26);
+                const to = '0x' + (log.topics[2] || '').slice(26);
+                const value = log.data === '0x' ? '0' : BigInt(log.data).toString();
+                const blockNum = parseInt(log.blockNumber, 16);
+                const estimatedTs = startTimestamp + Math.floor((blockNum - startBlock) * BLOCK_TIME);
+                allTxs.push({
+                  from, to, value,
+                  blockNumber: blockNum.toString(),
+                  timeStamp: estimatedTs.toString(),
+                  hash: log.transactionHash,
+                  tokenDecimal: '18',
+                } as any);
+              }
+            }
+            if (json.error) {
+              console.log(`[RPC] Error at block ${sub}-${subTo}: ${json.error.message || JSON.stringify(json.error)}`);
+              // Don't break — might be transient. Just skip this sub-chunk.
+            }
+          } catch (e: any) {
+            console.log(`[RPC] Fetch error at block ${sub}: ${e?.message?.slice(0, 80)}`);
+          }
+        }
+        console.log(`[RPC] Chunk ${i + 1}/${NUM_CHUNKS}: ${allTxs.length} transfers so far`);
+        onProgress?.(i + 1, NUM_CHUNKS, allTxs.length);
+        await new Promise(r => setTimeout(r, 50));
+      }
+      onProgress?.(15, 15, allTxs.length);
     }
   }
 
